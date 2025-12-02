@@ -1,5 +1,15 @@
 <h1 align="center">EMem: A Simple Yet Strong Baseline for Long-Term Conversational Memory of LLM Agents</h1>
 
+<p align="center">
+    <a href="https://arxiv.org/abs/2511.17208"><img src="https://img.shields.io/badge/arXiv-2511.17208-b31b1b" alt="arXiv"></a>
+</p>
+
+<p align="center">
+    <img src="assets/emem_overview.png" width="80%">
+</p>
+
+
+
 EMem is a structured memory system designed to enable LLM-based conversational agents to maintain coherent, personalized interactions over extended multi-session dialogues. Unlike approaches that compress or chunk conversation history, EMem preserves information in a non-lossy form by decomposing each session into enriched **Elementary Discourse Units (EDUs)** — self-contained propositions with normalized entities and source turn attributions.
 
 Key features:
