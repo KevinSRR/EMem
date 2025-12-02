@@ -1,0 +1,94 @@
+[project]
+name = "emem"
+version = "0.1.0"
+description = "EMem: A Simple Yet Strong Baseline for Long-Term Conversational Memory of LLM Agents"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    # Core ML frameworks
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    
+    # OpenAI and LLM APIs
+    "openai>=1.50.0",
+    "tiktoken>=0.7.0",
+    "tenacity>=8.5.0",
+    
+    # Web framework and async
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "aiohttp>=3.9.0",
+    "httpx>=0.25.0",
+    
+    # Embeddings
+    "sentence-transformers>=3.0.0",
+    "gritlm>=1.0.0",
+    "einops>=0.7.0",
+    
+    # Graph processing
+    "python-igraph>=0.11.0",
+    
+    # Data processing
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+    
+    # Schema validation
+    "pydantic>=2.0.0",
+    
+    # Async support
+    "nest-asyncio>=1.5.0",
+    
+    # File locking and utilities
+    "filelock>=3.12.0",
+    "packaging>=23.0",
+    
+    # Evaluation metrics
+    "rouge-score>=0.1.2",
+    "bert-score>=0.3.13",
+    
+    # Utilities
+    "tqdm>=4.65.0",
+    "nltk>=3.8.0",
+]
+
+[project.optional-dependencies]
+# For local LLM inference with vLLM
+local = [
+    "vllm>=0.6.0",
+]
+
+# For development
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emem"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # Line too long - handled by formatter
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+
