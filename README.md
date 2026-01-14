@@ -35,6 +35,7 @@ Key features:
   - [LoCoMo Evaluation](#locomo-evaluation)
   - [LongMemEval Evaluation](#longmemeval-evaluation)
   - [Final Evaluation for Paper Reporting](#final-evaluation-for-paper-reporting)
+  - [Efficiency Evaluation](#efficiency-evaluation)
 - [Citation](#-citation)
 
 ## ✅ TODO
@@ -218,6 +219,33 @@ make final-eval-longmemeval RESULT_FILE=results/emem_longmemeval_results_xxx.pkl
 - `MAX_CONCURRENT`: Maximum concurrent API requests (default: 50)
 
 Final evaluation results (JSON with detailed metrics) will be saved to the same directory as the input `RESULT_FILE`.
+
+### Efficiency Evaluation
+
+To measure token consumption and latency metrics, use the efficiency evaluation commands:
+
+```bash
+# Efficiency evaluation for EMem-G (with PPR)
+make efficiency-eval-locomo
+
+# Efficiency evaluation for EMem (without PPR)
+make efficiency-eval-locomo-emem
+```
+
+**Parameters:**
+- `EFFICIENCY_NUM_SAMPLES`: Number of samples to evaluate (default: 10)
+- `EFFICIENCY_SAVE_DIR`: Directory to save efficiency results (default: `efficiency_results`)
+
+**Example:**
+```bash
+make efficiency-eval-locomo EFFICIENCY_NUM_SAMPLES=5 LLM_MODEL=gpt-4o-mini
+```
+
+This measures:
+- **Token consumption**: Average input tokens per query (retrieval + QA stages)
+- **Latency**: Average retrieval time, QA time, and total answering time per query
+
+*Note: Efficiency evaluation currently supports LoCoMo dataset only. LongMemEval support will be added in a future update.*
 
 ## 📄 Citation
 

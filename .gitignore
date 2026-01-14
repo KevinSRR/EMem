@@ -5,6 +5,7 @@
 # Output directories (generated during evaluation)
 outputs/
 results/
+efficiency_results/
 
 # Log files
 src/logs/

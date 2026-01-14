@@ -1498,6 +1498,317 @@ class EMem:
                 'num_selected': len(fallback_arguments)
             }
 
+    def batch_rerank_filter_structuring_v1(self,
+                                           queries: List[str],
+                                           all_candidate_items: List[List[str]],
+                                           all_candidate_indices: List[List[int]],
+                                           len_after_rerank: int = None) -> List[Tuple[List[int], List[str], dict]]:
+        """
+        Batch version of rerank_filter_structuring_v1 for improved efficiency.
+        
+        Processes all queries in a single batch LLM call instead of sequential calls.
+        
+        Args:
+            queries: List of query strings
+            all_candidate_items: List of candidate EDU lists (one per query)
+            all_candidate_indices: List of candidate index lists (one per query)
+            len_after_rerank: Maximum number of EDUs to return per query
+            
+        Returns:
+            List of tuples, each containing (filtered_indices, filtered_items, metadata_dict)
+        """
+        from .prompts.templates.edu_filter_v1 import FilteredEDUs
+        from .prompts import PromptTemplateManager
+        from .utils.llm_utils import fix_broken_generated_json
+        from .utils.config_utils import get_support_json_schema
+        import difflib
+        import json
+        
+        if not queries:
+            return []
+        
+        support_json_schema = get_support_json_schema()
+        prompt_template_manager = PromptTemplateManager(
+            role_mapping={"system": "system", "user": "user", "assistant": "assistant"}
+        )
+        
+        # Prepare all messages
+        all_messages = []
+        valid_query_indices = []  # Track which queries have candidates
+        
+        for q_idx, (query, candidate_items) in enumerate(zip(queries, all_candidate_items)):
+            if len(candidate_items) == 0:
+                continue
+            
+            valid_query_indices.append(q_idx)
+            
+            if self.global_config.date_format_type == "longmemeval":
+                messages = prompt_template_manager.render(
+                    name='edu_filter_v1',
+                    query=query,
+                    candidate_edus=json.dumps(candidate_items, indent=2)
+                )
+            else:
+                messages = prompt_template_manager.render(
+                    name='edu_filter_locomo_v1',
+                    query=query,
+                    candidate_edus=json.dumps(candidate_items, indent=2)
+                )
+            all_messages.append(messages)
+        
+        # Initialize results with empty defaults
+        results = [
+            ([], [], {'confidence': None, 'num_candidates': 0, 'num_selected': 0})
+            for _ in range(len(queries))
+        ]
+        
+        if not all_messages:
+            return results
+        
+        # Batch LLM call
+        try:
+            if support_json_schema:
+                batch_results = self.llm_model.batch_infer(messages=all_messages, response_format=FilteredEDUs)
+            else:
+                batch_results = self.llm_model.batch_infer(messages=all_messages)
+        except Exception as e:
+            logger.error(f"Batch EDU reranking failed: {str(e)}")
+            # Fallback: return all candidates
+            for q_idx in valid_query_indices:
+                candidate_items = all_candidate_items[q_idx]
+                candidate_indices = all_candidate_indices[q_idx]
+                if len_after_rerank is not None:
+                    results[q_idx] = (
+                        candidate_indices[:len_after_rerank],
+                        candidate_items[:len_after_rerank],
+                        {'error': str(e), 'num_candidates': len(candidate_items)}
+                    )
+                else:
+                    results[q_idx] = (candidate_indices, candidate_items, {'error': str(e)})
+            return results
+        
+        # Process batch results
+        for batch_idx, q_idx in enumerate(valid_query_indices):
+            candidate_items = all_candidate_items[q_idx]
+            candidate_indices = all_candidate_indices[q_idx]
+            
+            try:
+                raw_response, metadata, cache_hit = batch_results[batch_idx]
+                metadata['cache_hit'] = cache_hit
+                
+                if metadata.get('finish_reason') == 'length':
+                    real_response = fix_broken_generated_json(raw_response)
+                else:
+                    real_response = raw_response
+                
+                filtered_result = FilteredEDUs.model_validate_json(real_response)
+                selected_edus = filtered_result.selected_edus
+                
+                # Match selected EDUs back to candidate items
+                result_indices = []
+                matched_edus = []
+                
+                for selected_edu in selected_edus:
+                    closest_matches = difflib.get_close_matches(
+                        str(selected_edu),
+                        [str(item) for item in candidate_items],
+                        n=1,
+                        cutoff=0.85
+                    )
+                    
+                    if closest_matches:
+                        try:
+                            matched_idx = candidate_items.index(closest_matches[0])
+                            if matched_idx not in result_indices:
+                                result_indices.append(matched_idx)
+                                matched_edus.append(candidate_items[matched_idx])
+                        except ValueError:
+                            pass
+                
+                filtered_indices = [candidate_indices[i] for i in result_indices if i < len(candidate_indices)]
+                filtered_items = matched_edus
+                
+                if len_after_rerank is not None:
+                    filtered_indices = filtered_indices[:len_after_rerank]
+                    filtered_items = filtered_items[:len_after_rerank]
+                
+                results[q_idx] = (
+                    filtered_indices,
+                    filtered_items,
+                    {'num_candidates': len(candidate_items), 'num_selected': len(filtered_items), 'cache_hit': cache_hit}
+                )
+                
+            except Exception as e:
+                logger.warning(f"Error processing EDU rerank result for query {q_idx}: {str(e)}")
+                if len_after_rerank is not None:
+                    results[q_idx] = (
+                        candidate_indices[:len_after_rerank],
+                        candidate_items[:len_after_rerank],
+                        {'error': str(e)}
+                    )
+                else:
+                    results[q_idx] = (candidate_indices, candidate_items, {'error': str(e)})
+        
+        return results
+
+    def batch_rerank_filter_arguments_v1(self,
+                                         queries: List[str],
+                                         all_candidate_arguments: List[List[str]],
+                                         all_candidate_arg_keys: List[List[str]],
+                                         all_candidate_arg_scores: List[List[float]],
+                                         len_after_rerank: int = None) -> List[Tuple[List[str], List[str], List[float], dict]]:
+        """
+        Batch version of rerank_filter_arguments_v1 for improved efficiency.
+        
+        Processes all queries in a single batch LLM call instead of sequential calls.
+        
+        Args:
+            queries: List of query strings
+            all_candidate_arguments: List of candidate argument lists (one per query)
+            all_candidate_arg_keys: List of candidate arg key lists (one per query)
+            all_candidate_arg_scores: List of candidate score lists (one per query)
+            len_after_rerank: Maximum number of arguments to return per query
+            
+        Returns:
+            List of tuples, each containing (filtered_arg_keys, filtered_arguments, filtered_scores, metadata_dict)
+        """
+        from .prompts.templates.argument_filter_v1 import FilteredArguments
+        from .prompts import PromptTemplateManager
+        from .utils.llm_utils import fix_broken_generated_json
+        from .utils.config_utils import get_support_json_schema
+        import difflib
+        import json
+        
+        if not queries:
+            return []
+        
+        support_json_schema = get_support_json_schema()
+        prompt_template_manager = PromptTemplateManager(
+            role_mapping={"system": "system", "user": "user", "assistant": "assistant"}
+        )
+        
+        # Prepare all messages
+        all_messages = []
+        valid_query_indices = []
+        
+        for q_idx, (query, candidate_arguments) in enumerate(zip(queries, all_candidate_arguments)):
+            if len(candidate_arguments) == 0:
+                continue
+            
+            valid_query_indices.append(q_idx)
+            
+            if self.global_config.date_format_type == "longmemeval":
+                messages = prompt_template_manager.render(
+                    name='argument_filter_v1',
+                    query=query,
+                    candidate_arguments=json.dumps(candidate_arguments, indent=2)
+                )
+            else:
+                messages = prompt_template_manager.render(
+                    name='argument_filter_locomo_v1',
+                    query=query,
+                    candidate_arguments=json.dumps(candidate_arguments, indent=2)
+                )
+            all_messages.append(messages)
+        
+        # Initialize results with empty defaults
+        results = [
+            ([], [], [], {'confidence': None, 'num_candidates': 0, 'num_selected': 0})
+            for _ in range(len(queries))
+        ]
+        
+        if not all_messages:
+            return results
+        
+        # Batch LLM call
+        try:
+            if support_json_schema:
+                batch_results = self.llm_model.batch_infer(messages=all_messages, response_format=FilteredArguments)
+            else:
+                batch_results = self.llm_model.batch_infer(messages=all_messages)
+        except Exception as e:
+            logger.error(f"Batch argument reranking failed: {str(e)}")
+            for q_idx in valid_query_indices:
+                candidate_args = all_candidate_arguments[q_idx]
+                candidate_keys = all_candidate_arg_keys[q_idx]
+                candidate_scores = all_candidate_arg_scores[q_idx]
+                if len_after_rerank is not None:
+                    results[q_idx] = (
+                        candidate_keys[:len_after_rerank],
+                        candidate_args[:len_after_rerank],
+                        candidate_scores[:len_after_rerank],
+                        {'error': str(e)}
+                    )
+                else:
+                    results[q_idx] = (candidate_keys, candidate_args, candidate_scores, {'error': str(e)})
+            return results
+        
+        # Process batch results
+        for batch_idx, q_idx in enumerate(valid_query_indices):
+            candidate_arguments = all_candidate_arguments[q_idx]
+            candidate_arg_keys = all_candidate_arg_keys[q_idx]
+            candidate_arg_scores = all_candidate_arg_scores[q_idx]
+            
+            try:
+                raw_response, metadata, cache_hit = batch_results[batch_idx]
+                metadata['cache_hit'] = cache_hit
+                
+                if metadata.get('finish_reason') == 'length':
+                    real_response = fix_broken_generated_json(raw_response)
+                else:
+                    real_response = raw_response
+                
+                filtered_result = FilteredArguments.model_validate_json(real_response)
+                selected_arguments = filtered_result.selected_arguments
+                
+                result_arg_keys = []
+                result_arguments = []
+                result_scores = []
+                
+                for selected_arg in selected_arguments:
+                    closest_matches = difflib.get_close_matches(
+                        str(selected_arg),
+                        [str(arg) for arg in candidate_arguments],
+                        n=1,
+                        cutoff=0.85
+                    )
+                    
+                    if closest_matches:
+                        try:
+                            matched_idx = candidate_arguments.index(closest_matches[0])
+                            if matched_idx not in [candidate_arguments.index(arg) for arg in result_arguments]:
+                                result_arg_keys.append(candidate_arg_keys[matched_idx])
+                                result_arguments.append(candidate_arguments[matched_idx])
+                                result_scores.append(candidate_arg_scores[matched_idx])
+                        except (ValueError, IndexError):
+                            pass
+                
+                if len_after_rerank is not None:
+                    result_arg_keys = result_arg_keys[:len_after_rerank]
+                    result_arguments = result_arguments[:len_after_rerank]
+                    result_scores = result_scores[:len_after_rerank]
+                
+                results[q_idx] = (
+                    result_arg_keys,
+                    result_arguments,
+                    result_scores,
+                    {'num_candidates': len(candidate_arguments), 'num_selected': len(result_arguments), 'cache_hit': cache_hit}
+                )
+                
+            except Exception as e:
+                logger.warning(f"Error processing argument rerank result for query {q_idx}: {str(e)}")
+                if len_after_rerank is not None:
+                    results[q_idx] = (
+                        candidate_arg_keys[:len_after_rerank],
+                        candidate_arguments[:len_after_rerank],
+                        candidate_arg_scores[:len_after_rerank],
+                        {'error': str(e)}
+                    )
+                else:
+                    results[q_idx] = (candidate_arg_keys, candidate_arguments, candidate_arg_scores, {'error': str(e)})
+        
+        return results
+
     def run_ppr_structuring(self,
                 reset_prob: np.ndarray,
                 damping: float = 0.5) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -1953,7 +2264,18 @@ class EMem:
                  queries: List[str],
                  num_to_retrieve: int = None,
                  gold_docs: List[List[str]] = None,
-                 no_query_trace_saving: bool = False) -> List[QuerySolution] | Tuple[List[QuerySolution], Dict] | Tuple[List[QuerySolution], List[Dict]]:
+                 no_query_trace_saving: bool = False,
+                 use_batched_reranking: bool = True) -> List[QuerySolution] | Tuple[List[QuerySolution], Dict] | Tuple[List[QuerySolution], List[Dict]]:
+        """
+        Enhanced retrieval with optional batched reranking for improved efficiency.
+        
+        Args:
+            queries: List of query strings
+            num_to_retrieve: Number of results to retrieve per query
+            gold_docs: Optional gold documents for evaluation
+            no_query_trace_saving: Whether to skip saving query traces
+            use_batched_reranking: Whether to use batched LLM calls for reranking (default: True for efficiency)
+        """
         retrieve_start_time = time.time()  # Record start time
         
         # ========== HELPER FUNCTION: Balance EDUs by speaker (Can be commented out for ablation) ==========
@@ -2231,116 +2553,239 @@ class EMem:
         # Log the trace
         all_query_traces = [] # a list of {} corresponding to each input query
 
+        # ========== BATCHED OPTIMIZATION: Pre-compute all query-EDU similarities at once ==========
+        if use_batched_reranking and len(queries) > 1:
+            logger.info(f"Using batched retrieval optimization for {len(queries)} queries")
+            
+            # Step 1: Compute all query-EDU similarities using matrix multiplication
+            all_query_embeddings = np.array([
+                self.query_to_embedding['edu'].get(q, np.zeros(self.edu_embeddings.shape[1]))
+                for q in queries
+            ])
+            
+            # Matrix multiplication: (#queries, emb_dim) x (emb_dim, #edus) -> (#queries, #edus)
+            all_query_edu_scores = np.dot(all_query_embeddings, self.edu_embeddings.T)  # shape: (#queries, #edus)
+            
+            # Step 2: Get top-k candidates for each query (vectorized)
+            link_top_k: int = self.global_config.linking_top_k
+            
+            all_candidate_edu_indices = []
+            all_candidate_edus = []
+            
+            for q_idx in range(len(queries)):
+                query_edu_scores = all_query_edu_scores[q_idx]
+                if len(query_edu_scores) <= link_top_k:
+                    candidate_edu_indices = np.argsort(query_edu_scores)[::-1].tolist()
+                else:
+                    candidate_edu_indices = np.argsort(query_edu_scores)[-link_top_k:][::-1].tolist()
+                
+                real_candidate_edu_ids = [self.edu_node_keys[idx] for idx in candidate_edu_indices]
+                edu_row_dict = self.edu_embedding_store.get_rows(real_candidate_edu_ids)
+                candidate_edus = [edu_row_dict[idx]['content'] for idx in real_candidate_edu_ids]
+                
+                all_candidate_edu_indices.append(candidate_edu_indices)
+                all_candidate_edus.append(candidate_edus)
+            
+            # Step 3: Batch EDU reranking
+            logger.info(f"Batch EDU reranking for {len(queries)} queries")
+            batch_edu_rerank_start = time.time()
+            batch_edu_rerank_results = self.batch_rerank_filter_structuring_v1(
+                queries=queries,
+                all_candidate_items=all_candidate_edus,
+                all_candidate_indices=all_candidate_edu_indices,
+                len_after_rerank=link_top_k
+            )
+            batch_edu_rerank_time = time.time() - batch_edu_rerank_start
+            logger.info(f"Batch EDU reranking completed in {batch_edu_rerank_time:.2f}s")
+            
+            # Step 4: For EMem-G only, prepare and batch argument reranking
+            if not self.global_config.skip_retrieval_ppr:
+                all_candidate_arg_contents = []
+                all_candidate_arg_keys = []
+                all_candidate_arg_scores = []
+                
+                for q_idx, query in enumerate(queries):
+                    query_entities = query_to_entities.get(query, [])
+                    candidate_arg_info = {}
+                    
+                    if len(query_entities) > 0 and len(entity_to_embedding) > 0:
+                        for entity in query_entities:
+                            if entity in entity_to_embedding:
+                                entity_embedding = entity_to_embedding[entity]
+                                
+                                if len(self.argument_embeddings) > 0:
+                                    entity_arg_scores = np.dot(self.argument_embeddings, entity_embedding.T)
+                                    entity_arg_scores = np.squeeze(entity_arg_scores) if entity_arg_scores.ndim == 2 else entity_arg_scores
+                                    
+                                    top_k_arg_indices = np.argsort(entity_arg_scores)[-10:][::-1]
+                                    
+                                    for arg_idx in top_k_arg_indices:
+                                        arg_key = self.argument_node_keys[arg_idx]
+                                        similarity_score = entity_arg_scores[arg_idx]
+                                        
+                                        arg_row = self.argument_embedding_store.get_row(arg_key)
+                                        arg_content = arg_row["content"]
+                                        
+                                        if arg_key not in candidate_arg_info:
+                                            candidate_arg_info[arg_key] = {
+                                                "content": arg_content,
+                                                "max_score": similarity_score,
+                                                "arg_idx": arg_idx
+                                            }
+                                        elif similarity_score > candidate_arg_info[arg_key]["max_score"]:
+                                            candidate_arg_info[arg_key]["max_score"] = similarity_score
+                    
+                    candidate_keys = list(candidate_arg_info.keys())
+                    candidate_contents = [candidate_arg_info[k]["content"] for k in candidate_keys]
+                    candidate_scores = [candidate_arg_info[k]["max_score"] for k in candidate_keys]
+                    
+                    all_candidate_arg_keys.append(candidate_keys)
+                    all_candidate_arg_contents.append(candidate_contents)
+                    all_candidate_arg_scores.append(candidate_scores)
+                
+                # Batch argument reranking
+                logger.info(f"Batch argument reranking for {len(queries)} queries")
+                batch_arg_rerank_start = time.time()
+                batch_arg_rerank_results = self.batch_rerank_filter_arguments_v1(
+                    queries=queries,
+                    all_candidate_arguments=all_candidate_arg_contents,
+                    all_candidate_arg_keys=all_candidate_arg_keys,
+                    all_candidate_arg_scores=all_candidate_arg_scores,
+                    len_after_rerank=None
+                )
+                batch_arg_rerank_time = time.time() - batch_arg_rerank_start
+                logger.info(f"Batch argument reranking completed in {batch_arg_rerank_time:.2f}s")
+            else:
+                batch_arg_rerank_results = None
+            
+            self.rerank_time += batch_edu_rerank_time
+            if batch_arg_rerank_results is not None:
+                self.rerank_time += batch_arg_rerank_time
+        else:
+            # Use original sequential processing for single query or when disabled
+            batch_edu_rerank_results = None
+            batch_arg_rerank_results = None
+            all_query_edu_scores = None
+            all_candidate_edu_indices = None
+            all_candidate_edus = None
+            all_candidate_arg_keys = None
+            all_candidate_arg_contents = None
+            all_candidate_arg_scores = None
+        # ========== END BATCHED OPTIMIZATION ==========
+
         for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
             query_trace = {}
             rerank_start = time.time()
 
-            # get edu scores
-            query_embedding = self.query_to_embedding['edu'].get(query, None)
-            if query_embedding is None:
-                query_embedding = self.embedding_model.batch_encode(
-                    query, 
-                    # instruction="query" if "e5" in self.global_config.embedding_model_name.lower() else get_query_instruction('query_to_sentence'), 
-                    instruction=get_query_instruction('query_to_sentence'), 
-                    norm=True
-                )
-
-            if len(self.edu_embeddings) == 0:
-                error_msg = "No EDU embeddings available for retrieval"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-
-            try:
-                query_edu_scores = np.dot(self.edu_embeddings, query_embedding.T) # shape: (#edus, )
-                query_edu_scores = np.squeeze(query_edu_scores) if query_edu_scores.ndim == 2 else query_edu_scores
-            except Exception as e:
-                raise e
-
-
-            # rerank edus
-            link_top_k: int = self.global_config.linking_top_k
-            if len(query_edu_scores) == 0 or len(self.edu_node_keys) == 0:
-                error_msg = f"Cannot proceed with retrieval - query_edu_scores: {len(query_edu_scores)}, edu_node_keys: {len(self.edu_node_keys)}"
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-
-            # Log the trace
-            query_trace["query_to_edu"] = None
-            try:
-                # Get the top k edus by scores
-                if len(query_edu_scores) <= link_top_k:
-                    # If we have fewer edus than requested, use all of them
-                    candidate_edu_indices = np.argsort(query_edu_scores)[::-1].tolist()
-                else:
-                    # Otherwise get the top k
-                    candidate_edu_indices = np.argsort(query_edu_scores)[-link_top_k:][::-1].tolist()
+            # ========== USE BATCHED RESULTS IF AVAILABLE ==========
+            if batch_edu_rerank_results is not None:
+                # Use pre-computed results from batch processing
+                query_edu_scores = all_query_edu_scores[q_idx]
+                candidate_edu_indices = all_candidate_edu_indices[q_idx]
+                candidate_edus = all_candidate_edus[q_idx]
+                top_k_edu_indices, top_k_edus, reranker_dict = batch_edu_rerank_results[q_idx]
                 
-                # # ========== APPLY FEATURE 1: Balance candidate EDUs by speaker ==========
-                # candidate_edu_indices = balance_edus_by_speaker(
-                #     candidate_edu_indices, query_edu_scores, self.edu_node_keys, 
-                #     self.edu_node_idx_to_speaker, self.node_name_to_vertex_idx, link_top_k
-                # )
-                # # ========== END APPLY FEATURE 1 ==========
-                
-                # Get the actual edu IDs
+                link_top_k = self.global_config.linking_top_k
                 real_candidate_edu_ids = [self.edu_node_keys[idx] for idx in candidate_edu_indices]
                 edu_row_dict = self.edu_embedding_store.get_rows(real_candidate_edu_ids)
-                candidate_edus = [edu_row_dict[idx]['content'] for idx in real_candidate_edu_ids]
-
-                # Log the trace
+                
                 query_trace["query_to_edu"] = {
                     "pre_rerank": {
                         "real_candidate_edu_ids": real_candidate_edu_ids,
                         "edu_row_dict": edu_row_dict,
                         "candidate_edus": candidate_edus,
                     },
-                    "post_rerank": None
+                    "post_rerank": {
+                        "top_k_edu_indices": top_k_edu_indices,
+                        "top_k_edus": top_k_edus,
+                    }
                 }
+            else:
+                # ========== ORIGINAL SEQUENTIAL PROCESSING ==========
+                # get edu scores
+                query_embedding = self.query_to_embedding['edu'].get(query, None)
+                if query_embedding is None:
+                    query_embedding = self.embedding_model.batch_encode(
+                        query, 
+                        instruction=get_query_instruction('query_to_sentence'), 
+                        norm=True
+                    )
 
-                # Rerank the edus
-                top_k_edu_indices, top_k_edus, reranker_dict = self.rerank_filter_structuring_v1(
-                    query,
-                    candidate_edus,
-                    candidate_edu_indices,
-                    len_after_rerank=link_top_k
-                )
-                # top_k_edu_indices, top_k_edus = candidate_edu_indices, candidate_edus
+                if len(self.edu_embeddings) == 0:
+                    error_msg = "No EDU embeddings available for retrieval"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
 
-                if self.global_config.skip_retrieval_ppr:
-                    # Enrich EDUs with speaker and temporal metadata
-                    enriched_edus = self._enrich_edus_with_metadata(top_k_edu_indices, [])
+                try:
+                    query_edu_scores = np.dot(self.edu_embeddings, query_embedding.T)
+                    query_edu_scores = np.squeeze(query_edu_scores) if query_edu_scores.ndim == 2 else query_edu_scores
+                except Exception as e:
+                    raise e
+
+                link_top_k: int = self.global_config.linking_top_k
+                if len(query_edu_scores) == 0 or len(self.edu_node_keys) == 0:
+                    error_msg = f"Cannot proceed with retrieval - query_edu_scores: {len(query_edu_scores)}, edu_node_keys: {len(self.edu_node_keys)}"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+
+                query_trace["query_to_edu"] = None
+                try:
+                    if len(query_edu_scores) <= link_top_k:
+                        candidate_edu_indices = np.argsort(query_edu_scores)[::-1].tolist()
+                    else:
+                        candidate_edu_indices = np.argsort(query_edu_scores)[-link_top_k:][::-1].tolist()
                     
-                    retrieval_results.append(QuerySolution(
-                        question=query, 
-                        docs=['1','2'], 
-                        doc_scores=[1,2], 
-                        edus=enriched_edus, 
-                        edu_scores=[1,2]
-                    ))
+                    real_candidate_edu_ids = [self.edu_node_keys[idx] for idx in candidate_edu_indices]
+                    edu_row_dict = self.edu_embedding_store.get_rows(real_candidate_edu_ids)
+                    candidate_edus = [edu_row_dict[idx]['content'] for idx in real_candidate_edu_ids]
 
-                    # Log the trace
+                    query_trace["query_to_edu"] = {
+                        "pre_rerank": {
+                            "real_candidate_edu_ids": real_candidate_edu_ids,
+                            "edu_row_dict": edu_row_dict,
+                            "candidate_edus": candidate_edus,
+                        },
+                        "post_rerank": None
+                    }
+
+                    # Sequential reranking (original path)
+                    top_k_edu_indices, top_k_edus, reranker_dict = self.rerank_filter_structuring_v1(
+                        query,
+                        candidate_edus,
+                        candidate_edu_indices,
+                        len_after_rerank=link_top_k
+                    )
+
                     query_trace["query_to_edu"]["post_rerank"] = {
                         "top_k_edu_indices": top_k_edu_indices,
                         "top_k_edus": top_k_edus,
                     }
-                    all_query_traces.append(query_trace)
-                    continue 
 
+                except Exception as e:
+                    logger.error(f"Error in EDU reranking: {str(e)}")
+                    top_k_edu_indices, top_k_edus = [], []
+                    reranker_dict = {'error': str(e)}
 
-                rerank_log = {'edus_before_rerank': candidate_edus, 'edus_after_rerank': top_k_edus}
+            # Handle EMem mode (skip PPR)
+            if self.global_config.skip_retrieval_ppr:
+                # Enrich EDUs with speaker and temporal metadata
+                enriched_edus = self._enrich_edus_with_metadata(top_k_edu_indices, [])
+                
+                retrieval_results.append(QuerySolution(
+                    question=query, 
+                    docs=['1','2'], 
+                    doc_scores=[1,2], 
+                    edus=enriched_edus, 
+                    edu_scores=[1,2]
+                ))
 
-                # Log the trace
-                query_trace["query_to_edu"]["post_rerank"] = {
-                    "top_k_edu_indices": top_k_edu_indices,
-                    "top_k_edus": top_k_edus,
-                }
+                all_query_traces.append(query_trace)
+                continue 
 
-            except Exception as e:
-                logger.error(f"Error in EDU reranking: {str(e)}")
-                top_k_edu_indices, top_k_edus, rerank_log = [], [], {'edus_before_rerank': [], 'edus_after_rerank': [], 'error': str(e)}
-            rerank_end = time.time()
-
-            self.rerank_time += rerank_end - rerank_start
+            # Track reranking time only for non-batched path
+            if batch_edu_rerank_results is None:
+                rerank_end = time.time()
+                self.rerank_time += rerank_end - rerank_start
 
             if len(top_k_edus) == 0:
                 if not self.global_config.query_to_session_retrieval:
@@ -2367,83 +2812,106 @@ class EMem:
             # Add query entity matching weights to arguments
             query_entities = query_to_entities.get(query, [])
             
-            # Collect all candidate arguments from all query entities
-            all_candidate_arg_info = {}  # arg_key -> (arg_content, max_similarity_score, source_entities)
-            
-            if len(query_entities) > 0 and len(entity_to_embedding) > 0:
-                for entity in query_entities:
-                    if entity in entity_to_embedding:
-                        entity_embedding = entity_to_embedding[entity]
-                        
-                        # Compute similarity scores with all arguments
-                        if len(self.argument_embeddings) > 0:
-                            entity_arg_scores = np.dot(self.argument_embeddings, entity_embedding.T)
-                            entity_arg_scores = np.squeeze(entity_arg_scores) if entity_arg_scores.ndim == 2 else entity_arg_scores
+            # Check if batched argument reranking results are available
+            if batch_arg_rerank_results is not None:
+                # Use pre-computed results from batch processing
+                filtered_arg_keys, filtered_arg_contents, filtered_arg_scores, reranker_metadata = batch_arg_rerank_results[q_idx]
+                
+                # Still need to build candidate info for tracing
+                candidate_arg_keys = all_candidate_arg_keys[q_idx] if q_idx < len(all_candidate_arg_keys) else []
+                candidate_arg_contents = all_candidate_arg_contents[q_idx] if q_idx < len(all_candidate_arg_contents) else []
+                candidate_arg_scores = all_candidate_arg_scores[q_idx] if q_idx < len(all_candidate_arg_scores) else []
+                
+                # Build pre-rerank trace from pre-computed data
+                for i, arg_key in enumerate(candidate_arg_keys):
+                    query_trace["query_ner_to_argument_linking"]["pre_rerank"].append({
+                        "query_entity": "batched",  # Entity info not tracked in batch mode
+                        "arg_idx": -1,
+                        "arg_content": candidate_arg_contents[i],
+                        "arg_key": arg_key,
+                        "query_arg_similarity_score": float(candidate_arg_scores[i])
+                    })
+                
+                logger.info(f"Using batched rerank: {len(candidate_arg_keys)} candidates -> {len(filtered_arg_keys)} filtered")
+            else:
+                # Original sequential processing path
+                # Collect all candidate arguments from all query entities
+                all_candidate_arg_info = {}  # arg_key -> (arg_content, max_similarity_score, source_entities)
+                
+                if len(query_entities) > 0 and len(entity_to_embedding) > 0:
+                    for entity in query_entities:
+                        if entity in entity_to_embedding:
+                            entity_embedding = entity_to_embedding[entity]
                             
-                            # Get top 10 similar arguments for this entity (no threshold)
-                            top_k_arg_indices = np.argsort(entity_arg_scores)[-10:][::-1]
-                            
-                            for arg_idx in top_k_arg_indices:
-                                arg_key = self.argument_node_keys[arg_idx]
-                                similarity_score = entity_arg_scores[arg_idx]
+                            # Compute similarity scores with all arguments
+                            if len(self.argument_embeddings) > 0:
+                                entity_arg_scores = np.dot(self.argument_embeddings, entity_embedding.T)
+                                entity_arg_scores = np.squeeze(entity_arg_scores) if entity_arg_scores.ndim == 2 else entity_arg_scores
                                 
-                                # Get argument content
-                                arg_row = self.argument_embedding_store.get_row(arg_key)
-                                arg_content = arg_row["content"]
+                                # Get top 10 similar arguments for this entity (no threshold)
+                                top_k_arg_indices = np.argsort(entity_arg_scores)[-10:][::-1]
                                 
-                                # Store candidate argument info (keep track of max similarity and source entities)
-                                if arg_key not in all_candidate_arg_info:
-                                    all_candidate_arg_info[arg_key] = {
-                                        "content": arg_content,
-                                        "max_score": similarity_score,
-                                        "source_entities": [entity],
-                                        "arg_idx": arg_idx
-                                    }
-                                else:
-                                    # Update max score if this entity has higher similarity
-                                    if similarity_score > all_candidate_arg_info[arg_key]["max_score"]:
-                                        all_candidate_arg_info[arg_key]["max_score"] = similarity_score
-                                    all_candidate_arg_info[arg_key]["source_entities"].append(entity)
-                                
-                                # Store for pre-rerank tracing
-                                query_trace["query_ner_to_argument_linking"]["pre_rerank"].append({
-                                    "query_entity": entity,
-                                    "arg_idx": int(arg_idx),
-                                    "arg_content": arg_content,
-                                    "arg_key": arg_key,
-                                    "query_arg_similarity_score": float(similarity_score)
-                                })
-            
-            logger.info(f"Num of candidate argument nodes before reranking={len(all_candidate_arg_info)}")
-            
-            # Prepare candidate arguments for filtering
-            candidate_arg_keys = list(all_candidate_arg_info.keys())
-            candidate_arg_contents = [all_candidate_arg_info[k]["content"] for k in candidate_arg_keys]
-            candidate_arg_scores = [all_candidate_arg_info[k]["max_score"] for k in candidate_arg_keys]
-            
-            # Filter arguments using LLM-based reranker (similar to EDU filtering)
-            filtered_arg_keys = []
-            filtered_arg_contents = []
-            filtered_arg_scores = []
-            reranker_metadata = {}
-            
-            if len(candidate_arg_contents) > 0:
-                try:
-                    filtered_arg_keys, filtered_arg_contents, filtered_arg_scores, reranker_metadata = self.rerank_filter_arguments_v1(
-                        query,
-                        candidate_arg_contents,
-                        candidate_arg_keys,
-                        candidate_arg_scores,
-                        len_after_rerank=None  # Keep all selected arguments
-                    )
-                    logger.info(f"Identified {len(filtered_arg_keys)} relevant argument nodes")
-                except Exception as e:
-                    logger.error(f"Error in argument reranking: {str(e)}")
-                    # Fallback: use all candidates
-                    filtered_arg_keys = candidate_arg_keys
-                    filtered_arg_contents = candidate_arg_contents
-                    filtered_arg_scores = candidate_arg_scores
-                    reranker_metadata = {'error': str(e)}
+                                for arg_idx in top_k_arg_indices:
+                                    arg_key = self.argument_node_keys[arg_idx]
+                                    similarity_score = entity_arg_scores[arg_idx]
+                                    
+                                    # Get argument content
+                                    arg_row = self.argument_embedding_store.get_row(arg_key)
+                                    arg_content = arg_row["content"]
+                                    
+                                    # Store candidate argument info (keep track of max similarity and source entities)
+                                    if arg_key not in all_candidate_arg_info:
+                                        all_candidate_arg_info[arg_key] = {
+                                            "content": arg_content,
+                                            "max_score": similarity_score,
+                                            "source_entities": [entity],
+                                            "arg_idx": arg_idx
+                                        }
+                                    else:
+                                        # Update max score if this entity has higher similarity
+                                        if similarity_score > all_candidate_arg_info[arg_key]["max_score"]:
+                                            all_candidate_arg_info[arg_key]["max_score"] = similarity_score
+                                        all_candidate_arg_info[arg_key]["source_entities"].append(entity)
+                                    
+                                    # Store for pre-rerank tracing
+                                    query_trace["query_ner_to_argument_linking"]["pre_rerank"].append({
+                                        "query_entity": entity,
+                                        "arg_idx": int(arg_idx),
+                                        "arg_content": arg_content,
+                                        "arg_key": arg_key,
+                                        "query_arg_similarity_score": float(similarity_score)
+                                    })
+                
+                logger.info(f"Num of candidate argument nodes before reranking={len(all_candidate_arg_info)}")
+                
+                # Prepare candidate arguments for filtering
+                candidate_arg_keys = list(all_candidate_arg_info.keys())
+                candidate_arg_contents = [all_candidate_arg_info[k]["content"] for k in candidate_arg_keys]
+                candidate_arg_scores = [all_candidate_arg_info[k]["max_score"] for k in candidate_arg_keys]
+                
+                # Filter arguments using LLM-based reranker (similar to EDU filtering)
+                filtered_arg_keys = []
+                filtered_arg_contents = []
+                filtered_arg_scores = []
+                reranker_metadata = {}
+                
+                if len(candidate_arg_contents) > 0:
+                    try:
+                        filtered_arg_keys, filtered_arg_contents, filtered_arg_scores, reranker_metadata = self.rerank_filter_arguments_v1(
+                            query,
+                            candidate_arg_contents,
+                            candidate_arg_keys,
+                            candidate_arg_scores,
+                            len_after_rerank=None  # Keep all selected arguments
+                        )
+                        logger.info(f"Identified {len(filtered_arg_keys)} relevant argument nodes")
+                    except Exception as e:
+                        logger.error(f"Error in argument reranking: {str(e)}")
+                        # Fallback: use all candidates
+                        filtered_arg_keys = candidate_arg_keys
+                        filtered_arg_contents = candidate_arg_contents
+                        filtered_arg_scores = candidate_arg_scores
+                        reranker_metadata = {'error': str(e)}
             
             # Store post-rerank trace
             query_trace["query_ner_to_argument_linking"]["post_rerank"] = {

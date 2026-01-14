@@ -3,7 +3,8 @@
 
 .PHONY: help install eval-locomo eval-locomo-emem eval-longmemeval eval-longmemeval-emem \
         eval-longmemeval-precache eval-longmemeval-skip-precache \
-        final-eval-locomo final-eval-longmemeval clean
+        final-eval-locomo final-eval-longmemeval \
+        efficiency-eval-locomo efficiency-eval-locomo-emem clean
 
 # Default target
 help:
@@ -23,6 +24,10 @@ help:
 	@echo "Final Evaluation for Paper (standardized metrics):"
 	@echo "  make final-eval-locomo RESULT_FILE=<path>      - Final eval on LoCoMo results"
 	@echo "  make final-eval-longmemeval RESULT_FILE=<path> - Final eval on LongMemEval results"
+	@echo ""
+	@echo "Efficiency Evaluation (for Table 2 metrics):"
+	@echo "  make efficiency-eval-locomo                    - Efficiency eval EMem-G on LoCoMo"
+	@echo "  make efficiency-eval-locomo-emem               - Efficiency eval EMem on LoCoMo"
 	@echo ""
 	@echo "Advanced LongMemEval commands:"
 	@echo "  make eval-longmemeval-precache      - Only pre-cache API calls"
@@ -98,8 +103,7 @@ eval-locomo:
 		--embedding_model '$(EMBEDDING_MODEL)' \
 		--save_frequency $(LOCOMO_SAVE_FREQUENCY) \
 		--save_dir '$(LOCOMO_SAVE_DIR)' \
-		--dataset_path '$(LOCOMO_DATASET)' \
-		--ratio_or_count 1
+		--dataset_path '$(LOCOMO_DATASET)'
 
 # Run EMem (without PPR) evaluation on LoCoMo dataset
 eval-locomo-emem:
@@ -237,6 +241,53 @@ endif
 		--longmemeval_path '$(LONGMEMEVAL_DATASET)' \
 		--num_runs $(NUM_RUNS) \
 		--max_concurrent $(MAX_CONCURRENT)
+
+# =============================================================================
+# EFFICIENCY EVALUATION (for LoCoMo - aligns with Table 2 in Nemori paper)
+# =============================================================================
+
+# Default efficiency eval settings
+EFFICIENCY_SAVE_DIR ?= efficiency_results
+EFFICIENCY_NUM_SAMPLES ?= 10
+
+# Efficiency evaluation for EMem-G (with PPR) on LoCoMo
+efficiency-eval-locomo:
+	@echo "Running efficiency evaluation for EMem-G on LoCoMo dataset..."
+	@echo "  Model Variant: EMem-G (with PPR)"
+	@echo "  LLM Model: $(LLM_MODEL)"
+	@echo "  Embedding Model: $(EMBEDDING_MODEL)"
+	@echo "  Dataset: $(LOCOMO_DATASET)"
+	@echo "  Num Samples: $(EFFICIENCY_NUM_SAMPLES)"
+	@echo "  Save Directory: $(EFFICIENCY_SAVE_DIR)"
+	@echo ""
+	@mkdir -p $(EFFICIENCY_SAVE_DIR)
+	$(call setup_env) && \
+	uv run python -u run_efficiency_eval.py \
+		--dataset_path '$(LOCOMO_DATASET)' \
+		--save_dir '$(EFFICIENCY_SAVE_DIR)' \
+		--llm_model '$(LLM_MODEL)' \
+		--embedding_model '$(EMBEDDING_MODEL)' \
+		--num_samples $(EFFICIENCY_NUM_SAMPLES)
+
+# Efficiency evaluation for EMem (without PPR) on LoCoMo
+efficiency-eval-locomo-emem:
+	@echo "Running efficiency evaluation for EMem on LoCoMo dataset..."
+	@echo "  Model Variant: EMem (without PPR)"
+	@echo "  LLM Model: $(LLM_MODEL)"
+	@echo "  Embedding Model: $(EMBEDDING_MODEL)"
+	@echo "  Dataset: $(LOCOMO_DATASET)"
+	@echo "  Num Samples: $(EFFICIENCY_NUM_SAMPLES)"
+	@echo "  Save Directory: $(EFFICIENCY_SAVE_DIR)"
+	@echo ""
+	@mkdir -p $(EFFICIENCY_SAVE_DIR)
+	$(call setup_env) && \
+	uv run python -u run_efficiency_eval.py \
+		--dataset_path '$(LOCOMO_DATASET)' \
+		--save_dir '$(EFFICIENCY_SAVE_DIR)' \
+		--llm_model '$(LLM_MODEL)' \
+		--embedding_model '$(EMBEDDING_MODEL)' \
+		--num_samples $(EFFICIENCY_NUM_SAMPLES) \
+		--skip_retrieval_ppr
 
 # =============================================================================
 # UTILITIES
