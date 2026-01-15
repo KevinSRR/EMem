@@ -301,18 +301,26 @@ def run_efficiency_evaluation(
                     sample_metrics.total_answering_time / sample_metrics.num_queries
                 )
             
-            # Store per-query metrics
+            # Store per-query metrics (using sample averages since batched processing doesn't give per-query breakdown)
             for q_idx, (qa, query_solution) in enumerate(zip(sample_qa_list, queries_solutions)):
                 query_metrics = EfficiencyMetrics(
                     query_idx=q_idx,
                     sample_id=sample.sample_id,
                     question=qa.question,
                     retrieval_prompt_tokens=int(sample_metrics.total_retrieval_prompt_tokens / sample_metrics.num_queries),
+                    retrieval_completion_tokens=int(sample_metrics.total_retrieval_completion_tokens / sample_metrics.num_queries),
                     qa_prompt_tokens=int(sample_metrics.total_qa_prompt_tokens / sample_metrics.num_queries),
+                    qa_completion_tokens=int(sample_metrics.total_qa_completion_tokens / sample_metrics.num_queries),
                     total_prompt_tokens=int((sample_metrics.total_retrieval_prompt_tokens + sample_metrics.total_qa_prompt_tokens) / sample_metrics.num_queries),
+                    total_completion_tokens=int((sample_metrics.total_retrieval_completion_tokens + sample_metrics.total_qa_completion_tokens) / sample_metrics.num_queries),
                     retrieval_time=sample_metrics.avg_retrieval_time,
                     qa_time=sample_metrics.avg_qa_time,
-                    total_time=sample_metrics.avg_answering_time
+                    total_time=sample_metrics.avg_answering_time,
+                    retrieval_llm_calls=retrieval_stats['call_count'] // sample_metrics.num_queries if sample_metrics.num_queries > 0 else 0,
+                    qa_llm_calls=qa_stats['call_count'] // sample_metrics.num_queries if sample_metrics.num_queries > 0 else 0,
+                    total_llm_calls=(retrieval_stats['call_count'] + qa_stats['call_count']) // sample_metrics.num_queries if sample_metrics.num_queries > 0 else 0,
+                    cache_hits=(retrieval_stats['cache_hits'] + qa_stats['cache_hits']) // sample_metrics.num_queries if sample_metrics.num_queries > 0 else 0,
+                    api_calls=(retrieval_stats['api_calls'] + qa_stats['api_calls']) // sample_metrics.num_queries if sample_metrics.num_queries > 0 else 0
                 )
                 all_query_metrics.append(query_metrics)
             

@@ -344,6 +344,15 @@ class APIRequest:
             status_tracker.num_rate_limit_errors += 1
             error = e
             
+        except openai.APIConnectionError as e:
+            # Connection errors need backoff - exponential delay before retry
+            attempts_made = self.attempts_left  # Will be decremented, so this is attempts remaining
+            backoff_seconds = min(2 ** (3 - attempts_made), 8)  # 1s, 2s, 4s, max 8s
+            logger.warning(f"Request {self.task_id} failed with APIConnectionError: {e}. Will retry in {backoff_seconds}s")
+            await asyncio.sleep(backoff_seconds)
+            status_tracker.num_api_errors += 1
+            error = e
+            
         except openai.OpenAIError as e:
             logger.warning(f"Request {self.task_id} failed with OpenAIError: {e}")
             status_tracker.num_api_errors += 1
@@ -518,37 +527,65 @@ class CacheOpenAI(BaseLLM):
         
         # Remove per-instance asyncio cache lock; rely on FileLock at SQLite level
         self._cache_lock = None
-        # if high_throughput:
-        #     limits = httpx.Limits(max_connections=500, max_keepalive_connections=100)
-        #     client = httpx.Client(limits=limits, timeout=httpx.Timeout(5*60, read=5*60))
-        # else:
-        #     client = None
-        # self.max_retries = kwargs.get("max_retries", 2)
-        # self.openai_client = OpenAI(base_url=self.llm_base_url, api_key=api_key, http_client=client, max_retries=self.max_retries)
-
+        
         self.api_key = api_key
         
-        # Initialize sync OpenAI client for individual infer calls
-        self.openai_client = OpenAI(base_url=self.llm_base_url, api_key=api_key)
-        
-        # Initialize async OpenAI client for async infer calls  
-        self.async_openai_client = AsyncOpenAI(base_url=self.llm_base_url, api_key=api_key)
-        
+        # Get retry settings
         self.max_retries = kwargs.get("max_retries", None)
         if self.max_retries is None: self.max_retries = kwargs.get("max_retry_attempts", 2)
         
+        # SDK retries handle transient connection errors with exponential backoff
+        # Default 2 matches SDK default; custom retry queue provides additional attempts
+        sdk_max_retries = kwargs.get("sdk_max_retries", 2)
+        
+        # Configure httpx client with proper connection limits and timeouts
+        # This prevents connection pool exhaustion and handles slow responses
+        http_limits = httpx.Limits(
+            max_connections=kwargs.get("max_connections", 100),
+            max_keepalive_connections=kwargs.get("max_keepalive_connections", 50)
+        )
+        http_timeout = httpx.Timeout(
+            timeout=kwargs.get("http_timeout", 120.0),  # Total timeout
+            connect=kwargs.get("http_connect_timeout", 30.0)  # Connection timeout
+        )
+        
+        # Initialize sync OpenAI client for individual infer calls
+        sync_http_client = httpx.Client(limits=http_limits, timeout=http_timeout)
+        self.openai_client = OpenAI(
+            base_url=self.llm_base_url, 
+            api_key=api_key, 
+            max_retries=sdk_max_retries,
+            http_client=sync_http_client
+        )
+        
+        # Initialize async OpenAI client for async infer calls with proper limits
+        async_http_client = httpx.AsyncClient(limits=http_limits, timeout=http_timeout)
+        self.async_openai_client = AsyncOpenAI(
+            base_url=self.llm_base_url, 
+            api_key=api_key, 
+            max_retries=sdk_max_retries,
+            http_client=async_http_client
+        )
+        
         self.seconds_to_pause_after_rate_limit_error = kwargs.get("seconds_to_pause_after_rate_limit_error", 15)
         self.seconds_to_sleep_each_loop = kwargs.get("seconds_to_sleep_each_loop", 0.001) # 1 ms limits max throughput to 1,000 requests per second
-        self.max_requests_per_minute = kwargs.get("max_requests_per_minute", 10000) # target number of requests to make per minute (will make less if limited by tokens), leave headroom by setting this to 50% or 75% of your limit
-        self.max_tokens_per_minute = kwargs.get("max_tokens_per_minute", 1000000) # target number of tokens to use per minute (will use less if limited by requests), leave headroom by setting this to 50% or 75% of your limit
+        self.max_requests_per_minute = kwargs.get("max_requests_per_minute", 10000) # target number of requests to make per minute
+        self.max_tokens_per_minute = kwargs.get("max_tokens_per_minute", 7500000) # target number of tokens to use per minute
         self.max_attempts = kwargs.get("max_attempts", 5) # number of times to retry a failed request before giving up
+        
+        # Max concurrent in-flight requests - prevents connection pool exhaustion
+        # This is separate from RPM: RPM controls rate over time, this limits simultaneous connections
+        self.max_concurrent_requests = kwargs.get("max_concurrent_requests", 50)
+        
         # Log the initial rate limit and timing parameters for debugging and transparency
         logger.info(
             f"Initialized CacheOpenAI with max_requests_per_minute={self.max_requests_per_minute}, "
             f"max_tokens_per_minute={self.max_tokens_per_minute}, "
+            f"max_concurrent_requests={self.max_concurrent_requests}, "
             f"seconds_to_pause_after_rate_limit_error={self.seconds_to_pause_after_rate_limit_error}, "
             f"seconds_to_sleep_each_loop={self.seconds_to_sleep_each_loop}, "
-            f"max_attempts={self.max_attempts}"
+            f"max_attempts={self.max_attempts}, "
+            f"sdk_max_retries={sdk_max_retries}"
         )
         
         # file to save immediate llm api calling results (including errors)
@@ -843,8 +880,10 @@ class CacheOpenAI(BaseLLM):
         **kwargs
     ) -> List[Tuple[str, dict]]:
         # self.openai_client = AsyncOpenAI(api_key=self.api_key)
-        results_future_list = []
         total_requests = len(messages)
+        
+        # Use dict to track results by task_id - retries will update the same slot
+        results_by_task_id = {}  # task_id -> asyncio.Future
         
         # initialize trackers
         queue_of_requests_to_retry = asyncio.Queue()
@@ -854,6 +893,9 @@ class CacheOpenAI(BaseLLM):
         status_tracker = StatusTracker() # single instance to track a collection of variables
         
         next_request = None  # variable to hold the next request to call
+        
+        # Semaphore to limit concurrent in-flight requests (prevents connection pool exhaustion)
+        concurrency_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         
         # initialize available capacity counts
         available_request_capacity = self.max_requests_per_minute
@@ -872,6 +914,14 @@ class CacheOpenAI(BaseLLM):
         pbar = tqdm(total=total_requests, desc="Batch LLM Inference", unit="req")
         last_progress_update = time.time()
         
+        # Wrapper to limit concurrent API calls using semaphore (defined once, reused)
+        async def call_with_concurrency_limit(req, sem, retry_q, save_path, tracker):
+            async with sem:
+                return await req.call_api(
+                    retry_queue=retry_q,
+                    save_filepath=save_path,
+                    status_tracker=tracker,
+                )
         
         # Use the instance async client - no need to create a new one or reassign
         while True:
@@ -929,6 +979,8 @@ class CacheOpenAI(BaseLLM):
             # if enough capacity available, call API (always allow cache hits)
             if next_request:
                 next_request_tokens = next_request.token_consumption
+                task_id = next_request.task_id  # Save task_id for result tracking
+                
                 # Pre-check cache hit first
                 will_be_cache_hit = await self._check_cache_hit(next_request.request_json)
 
@@ -941,10 +993,10 @@ class CacheOpenAI(BaseLLM):
                         status_tracker.num_tasks_succeeded += 1
                         status_tracker.num_cache_hits += 1
 
-                        # push a completed future to preserve ordering
+                        # Store result by task_id to maintain ordering
                         fut = asyncio.get_running_loop().create_future()
                         fut.set_result((message, metadata, True))
-                        results_future_list.append(fut)
+                        results_by_task_id[task_id] = fut
                         next_request = None
                     else:
                         # Fallback to capacity-checked scheduling if cache read failed
@@ -961,15 +1013,17 @@ class CacheOpenAI(BaseLLM):
                         status_tracker.num_tasks_started += 1
                     status_tracker.num_tasks_in_progress += 1
 
-                    # call API (always create task, let cache handling happen in call_api)
+                    # call API with concurrency limit - store/update by task_id so retries replace failed results
                     next_request_task = asyncio.create_task(
-                        next_request.call_api(
-                            retry_queue=queue_of_requests_to_retry,
-                            save_filepath=self.llm_calls_save_filepath,
-                            status_tracker=status_tracker,
+                        call_with_concurrency_limit(
+                            next_request,
+                            concurrency_semaphore,
+                            queue_of_requests_to_retry,
+                            self.llm_calls_save_filepath,
+                            status_tracker,
                         )
                     )
-                    results_future_list.append(next_request_task)
+                    results_by_task_id[task_id] = next_request_task  # Retries update same slot
                     next_request = None  # reset next_request to empty
                 
             # Update progress bar every second
@@ -1008,13 +1062,17 @@ class CacheOpenAI(BaseLLM):
                 logger.warning(f"Pausing to cool down until {time.ctime(status_tracker.time_of_last_rate_limit_error + self.seconds_to_pause_after_rate_limit_error)}")
             
         
-        # Collect results maintaining order
+        # Collect results maintaining order by task_id
         results = []
-        if results_future_list:
-            # Wait for all tasks to complete (like original gather)
-            results = await asyncio.gather(*results_future_list, return_exceptions=True)
+        if results_by_task_id:
+            # Sort by task_id to maintain original order
+            sorted_task_ids = sorted(results_by_task_id.keys())
+            futures = [results_by_task_id[tid] for tid in sorted_task_ids]
+            # Wait for all tasks to complete
+            gathered = await asyncio.gather(*futures, return_exceptions=True)
+            results = list(gathered)
         else:
-            # No non-cache tasks were created, all were cache hits
+            # No tasks were created
             results = []        
         
         # Final progress bar update
