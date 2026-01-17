@@ -39,7 +39,7 @@ Key features:
 
 ## ✅ TODO
 
-- [ ] Further refine the codebase and enhance the efficiency
+- [x] Further refine the codebase and enhance the efficiency
 - [ ] Add support for additional benchmarks
 - [ ] Add documentation for custom dataset integration
 
