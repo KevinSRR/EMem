@@ -22,6 +22,7 @@ Key features:
 
 ## 📰 News
 
+- **[2026.01]** Improved retrieval efficiency with batched LLM reranking and optimized API call handling.
 - **[2025.12]** We open-source the EMem codebase on LoCoMo and LongMemEval benchmarks.
 
 ## 📑 Table of Contents
